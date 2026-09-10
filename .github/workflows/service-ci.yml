@@ -1,0 +1,20 @@
+name: service-ci
+on:
+  push:
+    paths: ['service/**', '.github/workflows/service-ci.yml']
+  pull_request:
+    paths: ['service/**', '.github/workflows/service-ci.yml']
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - run: mvn -B test

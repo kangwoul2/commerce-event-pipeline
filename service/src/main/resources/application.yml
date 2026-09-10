@@ -1,0 +1,30 @@
+spring:
+  application:
+    name: commerce-events
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5435/commerce_events}
+    username: ${DATABASE_USER:commerce}
+    password: ${DATABASE_PASSWORD:commerce}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        enable.idempotence: true
+        acks: all
+    consumer:
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      auto-offset-reset: earliest
+      properties:
+        spring.json.trusted.packages: dev.kangwoul.commerce.purchase
+
+management:
+  endpoints.web.exposure.include: health,info,metrics,prometheus
+server:
+  shutdown: graceful
