@@ -13,18 +13,24 @@ spring:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer
       properties:
         enable.idempotence: true
         acks: all
+        max.block.ms: 5000
+        delivery.timeout.ms: 10000
+        request.timeout.ms: 5000
     consumer:
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
       auto-offset-reset: earliest
+      enable-auto-commit: false
       properties:
         spring.json.trusted.packages: dev.kangwoul.commerce.purchase
+    listener:
+      ack-mode: record
 
 management:
-  endpoints.web.exposure.include: health,info,metrics,prometheus
+  endpoints.web.exposure.include: health,info,metrics
 server:
   shutdown: graceful

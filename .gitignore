@@ -1,0 +1,7 @@
+service/target/
+__pycache__/
+*.pyc
+.idea/
+*.iml
+.env
+.tools/
