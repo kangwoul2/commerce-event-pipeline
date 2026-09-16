@@ -1,79 +1,136 @@
-# Commerce Event Pipeline Architecture Decisions
+# Commerce Event Pipeline 설계 결정
 
-## ADR-001. Purchase API와 analytics projection 분리
+## 1. 구매 API와 지역별 매출 집계를 분리
 
-### Context
-구매 요청 처리와 지역별 통계 집계를 같은 HTTP transaction에서 처리하면 downstream 분석 작업이 사용자 요청 latency에 직접 결합됩니다.
+### 문제
+구매 요청 처리와 지역별 통계 집계를 같은 HTTP 트랜잭션에서 처리하면 사용자 요청 지연시간이 분석 작업에 직접 영향을 받습니다.
 
-### Decision
-구매 API는 event를 Kafka에 발행하고 `202 Accepted`를 반환합니다. 지역별 매출 projection은 consumer가 비동기로 갱신합니다.
+### 선택
+구매 API는 이벤트를 Kafka에 발행하고 `202 Accepted`를 반환합니다. 지역별 매출 집계는 소비자가 비동기로 처리합니다.
 
-### Trade-off
-- 장점: ingestion latency와 projection workload 분리
-- 장점: 동일 event를 여러 consumer가 독립적으로 사용할 수 있음
-- 단점: eventual consistency 발생
-- 단점: broker availability와 consumer lag를 운영해야 함
+### 장단점
+장점:
+- 구매 요청과 집계 작업의 처리 시간을 분리할 수 있음
+- 같은 이벤트를 여러 소비자 그룹이 독립적으로 사용할 수 있음
 
----
-
-## ADR-002. Kafka message key로 region 사용
-
-### Context
-Kafka는 partition 내부 ordering을 보장합니다. 주요 projection 단위가 region이므로 같은 region event를 같은 partition으로 보내는 것이 직관적입니다.
-
-### Decision
-`region`을 record key로 사용합니다.
-
-### Risk
-특정 region traffic이 압도적으로 많으면 hot partition이 될 수 있습니다. 실제 traffic skew를 측정한 뒤 key 재설계를 검토해야 합니다.
+단점:
+- 요청 직후에는 집계 결과가 아직 반영되지 않을 수 있음
+- Kafka 상태와 소비자 지연을 운영 중 확인해야 함
 
 ---
 
-## ADR-003. Idempotent consumer를 DB unique key로 구현
+## 2. Kafka 메시지 키로 지역 사용
 
-### Context
-at-least-once consumer는 같은 event를 재수신할 수 있습니다. process memory set은 multi-instance와 restart에 안전하지 않습니다.
+### 문제
+Kafka는 같은 파티션 안에서만 순서를 보장합니다. 이 프로젝트의 주요 집계 단위는 지역입니다.
 
-### Decision
-`processed_events.event_id`를 PostgreSQL PK/unique boundary로 사용합니다.
+### 선택
+`region`을 메시지 키로 사용해 같은 지역의 이벤트가 같은 파티션으로 들어가도록 했습니다.
 
-### Why not Redis lock?
-이 문제는 critical section mutual exclusion보다 duplicate final effect 방지가 핵심입니다. DB unique constraint가 더 작고 직접적인 해결책입니다.
+### 위험
+특정 지역에 트래픽이 몰리면 한 파티션에 부하가 집중될 수 있습니다.
 
----
-
-## ADR-004. Dedup과 projection update를 같은 transaction으로 묶음
-
-### Context
-processed event 기록만 commit되고 aggregate update가 실패하면 retry 시 duplicate로 인식되어 projection이 영구적으로 누락될 수 있습니다.
-
-### Decision
-`processed_events insert + regional_sales update`를 하나의 local DB transaction으로 처리합니다.
+실제 트래픽 분포를 확인한 뒤 필요하면 `region + bucket`처럼 키를 더 세분화할 수 있습니다. 다만 이 경우 지역 전체에 대한 엄격한 순서 보장은 약해질 수 있습니다.
 
 ---
 
-## ADR-005. Regional aggregate는 atomic SQL update
+## 3. 멱등성을 DB 유일성 제약조건으로 보장
 
-### Context
-`SELECT → application increment → UPDATE`는 concurrent consumer에서 Lost Update를 만들 수 있습니다.
+### 문제
+최소 한 번 전달 방식에서는 같은 이벤트가 다시 전달될 수 있습니다. 서버 메모리의 `Set`만으로 중복을 관리하면 여러 서버가 상태를 공유할 수 없고, 재시작 시 기록도 사라집니다.
 
-### Decision
-PostgreSQL upsert/increment statement로 shared counter를 DB에서 atomic하게 변경합니다.
+### 선택
+`processed_events.event_id`를 PostgreSQL 기본 키로 사용합니다.
 
----
+같은 이벤트 ID가 동시에 저장되려고 해도 데이터베이스의 유일성 제약조건이 최종적으로 하나만 허용합니다.
 
-## ADR-006. Exactly-once라는 표현을 사용하지 않음
+### Redis 분산 락을 우선 사용하지 않은 이유
+이 문제의 핵심은 여러 서버가 동시에 같은 코드를 실행하는 것을 막는 것보다, **같은 이벤트의 최종 결과가 두 번 반영되지 않게 하는 것**입니다.
 
-현재 설계는 end-to-end exactly-once를 보장한다고 주장하지 않습니다. 보장 범위는 **동일 event ID 재전달 시 PostgreSQL projection final effect를 중복 적용하지 않는 것**입니다.
-
----
-
-## ADR-007. Outbox는 현재 미구현
-
-Producer-side DB business transaction과 Kafka publish를 원자적으로 연결해야 하는 요구가 생기면 Transactional Outbox를 검토합니다. 현재 저장소는 complete commerce transaction system이 아니므로 Outbox를 구현 완료 기능처럼 표시하지 않습니다.
+그래서 유일성 제약조건이 더 단순하고 직접적인 해결책이라고 판단했습니다.
 
 ---
 
-## ADR-008. DLQ는 poison message 요구가 생길 때 적용
+## 4. 중복 처리 기록과 집계 갱신을 같은 트랜잭션으로 묶음
 
-모든 오류를 무한 retry하지 않습니다. schema/business validation처럼 retry로 해결되지 않는 오류는 제한된 재시도 후 DLQ로 격리하는 것이 다음 단계입니다.
+### 문제
+이벤트 ID만 `processed_events`에 저장되고 지역별 매출 갱신이 실패하면, 다음 재시도에서는 이미 처리한 이벤트로 판단해 실제 매출 반영이 영원히 누락될 수 있습니다.
+
+### 선택
+다음 두 작업을 하나의 데이터베이스 트랜잭션으로 처리합니다.
+
+```text
+processed_events INSERT
++
+regional_sales UPDATE
+```
+
+두 작업이 함께 성공하거나 함께 취소되도록 만들어 중간 실패로 인한 누락을 방지합니다.
+
+---
+
+## 5. 지역별 매출은 데이터베이스에서 원자적으로 갱신
+
+### 문제
+다음 방식은 동시 처리에서 갱신 손실을 만들 수 있습니다.
+
+```text
+SELECT total
+→ 애플리케이션에서 total + amount 계산
+→ UPDATE total
+```
+
+두 요청이 같은 기존 값을 읽으면 한 요청의 증가분이 사라질 수 있습니다.
+
+### 선택
+PostgreSQL에서 한 문장으로 값을 증가시키는 원자적 갱신을 사용합니다.
+
+공유 값을 수정할 때 읽기-계산-저장을 애플리케이션으로 가져오지 않고 데이터베이스가 직접 갱신하도록 했습니다.
+
+---
+
+## 6. 정확히 한 번 처리라고 표현하지 않음
+
+현재 설계는 전체 시스템에 대해 정확히 한 번 처리를 보장한다고 주장하지 않습니다.
+
+보장 범위는 다음과 같습니다.
+
+> **동일한 이벤트 ID가 다시 전달되더라도 PostgreSQL의 지역별 매출 집계에는 중복 반영되지 않는다.**
+
+Kafka 전달 자체의 중복 가능성을 없앤 것이 아니라, 중복 전달이 발생해도 최종 결과를 안전하게 만든 것입니다.
+
+---
+
+## 7. 트랜잭셔널 아웃박스는 현재 미구현
+
+실제 주문 상태 저장과 Kafka 이벤트 발행을 반드시 함께 보장해야 하는 요구가 생기면 트랜잭셔널 아웃박스를 검토합니다.
+
+하나의 데이터베이스 트랜잭션 안에서 업무 데이터와 발행할 이벤트를 함께 저장한 뒤 별도 작업이 Kafka로 발행하는 방식입니다.
+
+현재 저장소는 완전한 주문 처리 시스템이 아니므로 아웃박스를 구현 완료 기능처럼 표현하지 않습니다.
+
+---
+
+## 8. DLQ는 재시도로 해결되지 않는 오류에 사용
+
+모든 오류를 무한히 재시도하지 않습니다.
+
+메시지 형식 오류나 업무 규칙 위반처럼 반복해도 해결되지 않는 오류는 정해진 횟수만 재시도한 뒤 DLQ로 격리하는 방식이 적합합니다.
+
+현재 프로젝트에서는 완전한 DLQ 운영 정책까지 구현하지 않았으며 향후 개선 항목으로 둡니다.
+
+---
+
+## 9. 설계 판단 기준
+
+이 프로젝트에서는 기술을 먼저 정하고 문제를 끼워 맞추지 않고 다음 순서로 판단했습니다.
+
+```text
+문제 확인
+→ 가장 단순한 대안 검토
+→ 현재 요구에 맞는 방법 선택
+→ 선택한 방법의 단점 확인
+→ 장애 상황에서 결과가 깨지지 않는지 검증
+```
+
+Kafka, 데이터베이스 유일성 제약조건, 트랜잭션, 원자적 갱신은 각각 다른 문제를 해결하기 위해 선택했습니다.
