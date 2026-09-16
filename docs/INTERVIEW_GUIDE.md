@@ -1,67 +1,215 @@
-# Commerce Event Pipeline Interview Guide
+# Commerce Event Pipeline 면접 가이드
 
-답변 순서는 항상 `문제 → 대안 → 선택 → trade-off → 검증`을 기준으로 합니다.
+답변 순서는 항상 **문제 → 대안 → 선택 → 단점 → 검증**으로 통일합니다.
+
+기술 고유명사는 그대로 사용하고, 설명 용어는 다음과 같이 통일합니다.
+
+- producer → 생산자
+- consumer → 소비자
+- consumer group → 소비자 그룹
+- publish → 발행
+- idempotency → 멱등성
+- projection → 집계 결과
+- aggregate → 집계
+- duplicate → 중복
+- unique constraint → 유일성 제약조건
+- atomic update → 원자적 갱신
+- Lost Update → 갱신 손실
+- latency → 지연시간
+- throughput → 처리량
+- failure scenario → 장애 상황
+
+---
 
 ## 1. 왜 Kafka를 사용했나요?
 
-구매 API가 분석 집계까지 동기적으로 수행하면 사용자 요청 latency와 downstream workload가 결합됩니다. 또한 같은 구매 event를 분석, 추천, 알림 등 여러 consumer가 독립적으로 사용할 수 있어야 합니다. 그래서 durable log와 consumer group을 제공하는 Kafka를 선택했습니다. 단순히 대용량이라는 이유만으로 선택한 것은 아닙니다.
+구매 API가 지역별 매출 집계까지 동기적으로 처리하면 사용자 요청 지연시간과 분석 작업이 서로 묶입니다. 또 같은 구매 이벤트를 분석, 추천, 알림처럼 여러 기능에서 독립적으로 사용할 수 있어야 했습니다.
+
+그래서 이벤트를 저장하고 소비자 그룹별로 독립 처리할 수 있으며, 파티션 단위 순서 보장과 재처리를 지원하는 Kafka를 선택했습니다.
+
+단순히 "대용량이라서 Kafka를 사용했다"고 설명하지 않습니다.
+
+---
 
 ## 2. 왜 API가 200이 아니라 202인가요?
 
-HTTP 응답 시점에는 event를 받아 broker에 전달하는 단계까지 수행하지만 최종 projection 완료는 consumer가 비동기로 처리합니다. 완료되지 않은 작업을 완료된 것처럼 200으로 표현하기보다 `202 Accepted`가 계약에 더 정확합니다.
+HTTP 응답 시점에는 구매 이벤트를 받아 Kafka에 발행하는 단계까지만 수행합니다. 지역별 매출 집계는 이후 소비자가 비동기로 처리합니다.
 
-## 3. Kafka ordering은 어디까지 보장되나요?
+따라서 최종 작업이 아직 끝나지 않았다는 의미를 정확히 표현하기 위해 `202 Accepted`를 사용했습니다.
 
-동일 partition 내부에서만 순서를 보장합니다. 전체 topic의 global ordering은 보장하지 않습니다. 이 프로젝트는 region별 projection을 사용하므로 region을 key로 보내 같은 region event가 같은 partition에 배치되도록 합니다.
+---
 
-## 4. region key의 단점은 무엇인가요?
+## 3. Kafka에서 순서는 어디까지 보장되나요?
 
-traffic이 특정 region에 편중되면 hot partition이 생길 수 있습니다. 실제 분포를 측정한 뒤 `region + bucket` 같은 key를 검토할 수 있지만, 그 경우 region 단위 strict ordering이 약해지는 trade-off가 있습니다.
+Kafka는 같은 파티션 안에서만 순서를 보장합니다. 주제 전체의 전역 순서를 보장하지는 않습니다.
 
-## 5. at-least-once가 왜 duplicate를 만들 수 있나요?
+이 프로젝트는 지역별 매출을 집계하므로 `region`을 메시지 키로 사용해 같은 지역의 이벤트가 같은 파티션으로 들어가도록 했습니다.
 
-consumer가 DB effect는 완료했지만 offset commit 전에 죽으면 broker는 같은 record를 다시 전달할 수 있습니다. 그래서 consumer 호출 횟수가 아니라 최종 effect가 idempotent해야 합니다.
+---
 
-## 6. duplicate 처리를 어떻게 했나요?
+## 4. 지역을 파티션 키로 사용하면 단점은 무엇인가요?
 
-`processed_events.event_id`에 unique/primary-key constraint를 두고 insert를 먼저 시도합니다. 새 ID인 경우에만 regional projection을 증가시킵니다. duplicate ID면 no-op합니다.
+특정 지역에 이벤트가 몰리면 한 파티션에 부하가 집중될 수 있습니다.
 
-## 7. Redis distributed lock을 왜 쓰지 않았나요?
+실제 트래픽 분포를 측정한 뒤 필요하면 `region + bucket`처럼 키를 더 세분화할 수 있습니다. 다만 이 경우 지역 전체에 대한 엄격한 순서 보장은 약해질 수 있습니다.
 
-현재 문제는 여러 process가 동시에 critical section에 들어가는 것 자체보다 같은 event의 최종 효과가 두 번 적용되는 것입니다. unique constraint + transaction이 더 직접적이고 실패 복구에도 유리합니다. lock은 coordination 문제가 별도로 생겼을 때 검토합니다.
+---
 
-## 8. dedup insert와 aggregate update를 왜 같은 transaction으로 묶나요?
+## 5. 최소 한 번 전달에서는 왜 중복 이벤트가 생길 수 있나요?
 
-processed event만 commit된 뒤 aggregate가 실패하면 retry 시 duplicate로 판단되어 aggregate가 영원히 반영되지 않을 수 있습니다. 두 mutation을 하나의 DB transaction으로 묶어 함께 commit/rollback합니다.
+소비자가 데이터베이스 반영까지 완료했지만 오프셋 커밋 전에 종료되면 Kafka는 해당 이벤트가 정상 처리됐는지 알 수 없어 다시 전달할 수 있습니다.
 
-## 9. Lost Update는 어떻게 막나요?
+그래서 이벤트가 한 번만 도착한다고 가정하지 않고, 같은 이벤트가 다시 들어와도 최종 결과가 한 번만 반영되도록 멱등성을 구현했습니다.
 
-application에서 현재 합계를 읽고 더한 뒤 update하는 read-modify-write를 사용하지 않습니다. PostgreSQL atomic upsert/increment를 사용해 concurrent update를 DB가 처리하도록 합니다.
+---
 
-## 10. Exactly-once를 구현한 건가요?
+## 6. 중복 처리는 어떻게 했나요?
 
-아닙니다. end-to-end exactly-once라는 표현은 하지 않습니다. 이 프로젝트가 보장하는 것은 동일 event ID가 재전달돼도 PostgreSQL projection final effect가 중복 적용되지 않는 idempotency입니다.
+`processed_events.event_id`를 기본 키로 두고 이벤트를 처리하기 전에 먼저 저장을 시도합니다.
 
-## 11. Producer가 Kafka publish 전에 죽으면요?
+- 새 이벤트 ID이면 지역별 매출을 증가
+- 이미 존재하는 이벤트 ID이면 중복으로 판단하고 종료
 
-현재 구조는 broker publish dependency를 직접 가집니다. business DB state와 event publish를 반드시 함께 보장해야 하는 서비스라면 Transactional Outbox가 필요합니다. 현재 프로젝트에는 full order transaction이 없기 때문에 Outbox를 완료 기능처럼 추가하지 않았습니다.
+서버 메모리가 아니라 PostgreSQL의 유일성 제약조건을 사용했기 때문에 여러 서버가 동시에 처리해도 하나의 기준으로 중복 여부를 판단할 수 있습니다.
 
-## 12. DLQ는 언제 필요하나요?
+---
 
-serialization/schema 오류처럼 retry로 해결되지 않는 poison message를 무한 반복하면 partition progress를 방해할 수 있습니다. retry limit 이후 별도 DLQ로 격리하고 원인을 관찰하는 구조가 적합합니다.
+## 7. Redis 분산 락을 왜 사용하지 않았나요?
 
-## 13. Kafka consumer lag는 왜 중요한가요?
+분산 락은 여러 서버가 같은 임계 구역을 동시에 실행하지 못하도록 조정할 때 유용합니다.
 
-API throughput이 정상이어도 consumer가 처리 속도를 따라가지 못하면 analytics 데이터가 오래 지연됩니다. 따라서 운영에서는 request latency와 별개로 consumer lag, processing latency, retry/error rate를 봐야 합니다.
+하지만 이 프로젝트의 핵심 문제는 "동시에 들어오지 못하게 하는 것"보다 **같은 이벤트의 최종 결과가 두 번 반영되지 않게 하는 것**입니다.
 
-## 14. Kafka가 과한 기술 아닌가요?
+그래서 이벤트 ID의 유일성 제약조건과 트랜잭션을 이용하는 방식이 더 직접적이라고 판단했습니다.
 
-단순 CRUD 서비스라면 과할 수 있습니다. 이 프로젝트에서는 동일 event의 replay, 여러 consumer 확장, asynchronous projection을 학습하고 검증하는 것이 목적입니다. 실제 제품에서 consumer가 하나이고 volume이 작다면 DB queue 같은 더 단순한 대안을 먼저 선택할 수 있습니다.
+---
 
-## 15. 이 프로젝트의 가장 중요한 개념은 무엇인가요?
+## 8. 중복 처리 기록과 매출 갱신을 왜 같은 트랜잭션으로 묶나요?
 
-Kafka 자체보다 **failure를 정상 경로로 가정한 것**입니다. event가 중복될 수 있고, consumer가 중간에 죽을 수 있고, concurrent update가 발생할 수 있다고 보고 idempotency와 transaction boundary를 설계했습니다.
+중복 처리 기록만 저장된 뒤 매출 갱신이 실패하면, 다음 재시도에서는 이미 처리한 이벤트로 판단해 매출이 영원히 누락될 수 있습니다.
 
-## 30-second answer
+따라서 다음 두 작업은 반드시 함께 성공하거나 함께 취소되도록 하나의 트랜잭션으로 묶었습니다.
 
-> 기존 E-commerce 분석 프로젝트를 실시간 구매 데이터가 생성되는 구조까지 확장했습니다. Purchase API는 이벤트를 Kafka로 발행하고 202를 반환하며, consumer는 PostgreSQL regional projection을 비동기로 갱신합니다. Kafka의 at-least-once 재전달에서 같은 구매가 두 번 집계될 수 있기 때문에 event ID를 DB unique key로 기록하고, dedup insert와 aggregate update를 하나의 transaction으로 묶었습니다. aggregate는 read-modify-write 대신 atomic SQL increment로 Lost Update를 피했습니다. Exactly-once라고 과장하지 않고, 제가 보장한 범위를 idempotent final effect로 한정해 설명합니다.
+```text
+processed_events 저장
++
+regional_sales 갱신
+```
+
+---
+
+## 9. 갱신 손실은 어떻게 막았나요?
+
+애플리케이션에서 현재 매출을 읽고 값을 더한 뒤 다시 저장하는 방식은 사용하지 않았습니다.
+
+```text
+SELECT total
+→ 애플리케이션에서 증가
+→ UPDATE total
+```
+
+이 방식은 여러 요청이 동시에 같은 값을 읽으면 증가분 하나가 사라지는 갱신 손실이 발생할 수 있습니다.
+
+그래서 PostgreSQL에서 값을 직접 증가시키는 원자적 갱신을 사용했습니다.
+
+---
+
+## 10. 정확히 한 번 처리를 구현한 건가요?
+
+전체 시스템에 대해 정확히 한 번 처리를 구현했다고 표현하지 않습니다.
+
+현재 구현이 보장하는 것은 **같은 이벤트 ID가 재전달되더라도 PostgreSQL 지역별 매출 집계에는 중복 반영되지 않는 것**입니다.
+
+Kafka 전달 자체가 한 번만 발생하는 것이 아니라, 중복 전달이 발생해도 최종 결과를 한 번만 반영하도록 만든 것입니다.
+
+---
+
+## 11. 생산자가 Kafka 발행 전에 실패하면 어떻게 되나요?
+
+현재 구조는 Kafka 발행에 직접 의존합니다.
+
+실제 주문 데이터 저장과 Kafka 이벤트 발행을 반드시 함께 보장해야 한다면 트랜잭셔널 아웃박스 패턴이 필요합니다.
+
+하나의 데이터베이스 트랜잭션에서 주문 상태와 발행할 이벤트를 함께 저장하고, 별도 작업이 아웃박스의 이벤트를 Kafka에 발행하는 방식입니다.
+
+현재 프로젝트에는 완전한 주문 트랜잭션이 없기 때문에 아웃박스를 구현 완료 기능처럼 설명하지 않습니다.
+
+---
+
+## 12. DLQ는 언제 필요한가요?
+
+메시지 형식 오류나 업무 규칙 위반처럼 재시도로 해결되지 않는 메시지를 계속 처리하면 같은 실패가 반복될 수 있습니다.
+
+이런 메시지는 정해진 횟수만 재시도한 뒤 DLQ로 격리하고 원인을 확인하는 방식이 적합합니다.
+
+현재 프로젝트에는 완전한 DLQ 운영 정책까지 구현하지 않았습니다.
+
+---
+
+## 13. 소비자 지연은 왜 중요한가요?
+
+구매 API가 정상적으로 요청을 받고 있어도 소비자 처리 속도가 이벤트 발생 속도를 따라가지 못하면 지역별 매출 데이터가 점점 늦게 반영됩니다.
+
+따라서 운영 환경에서는 API 지연시간뿐 아니라 다음 값도 함께 봐야 합니다.
+
+- 소비자 지연량
+- 이벤트 처리시간
+- 재시도 횟수
+- 오류율
+
+---
+
+## 14. Kafka가 너무 과한 기술 아닌가요?
+
+단순한 CRUD 서비스이고 후속 소비자가 하나뿐이며 이벤트 재처리 요구도 없다면 Kafka가 과할 수 있습니다.
+
+이 프로젝트에서는 동일 이벤트를 여러 기능이 독립적으로 처리하고, 재전달과 중복 처리까지 고려하는 이벤트 기반 구조를 학습하고 검증하는 것이 목적이었습니다.
+
+실제 제품에서는 요구사항이 단순하다면 DB 대기열 같은 더 작은 해결책도 먼저 고려하겠습니다.
+
+---
+
+## 15. 이 프로젝트에서 가장 중요한 개념은 무엇인가요?
+
+Kafka 자체보다 **장애와 중복 전달을 정상적으로 발생할 수 있는 상황으로 가정한 것**입니다.
+
+이벤트가 중복될 수 있고, 소비자가 처리 도중 종료될 수 있고, 여러 이벤트가 같은 값을 동시에 갱신할 수 있다고 보고 다음 세 가지를 설계했습니다.
+
+1. 이벤트 ID를 이용한 멱등성
+2. 중복 기록과 집계 갱신의 트랜잭션 처리
+3. 데이터베이스 원자적 갱신을 이용한 갱신 손실 방지
+
+---
+
+## 16. 30초 답변
+
+> 기존 전자상거래 데이터 분석 프로젝트를 실시간 이벤트 처리 구조로 확장했습니다. 구매 API는 이벤트를 Kafka에 발행하고 202를 반환하며, 소비자는 PostgreSQL의 지역별 매출을 비동기로 갱신합니다. Kafka에서는 같은 이벤트가 다시 전달될 수 있기 때문에 이벤트 ID를 데이터베이스 기본 키로 기록해 멱등성을 보장했습니다. 중복 처리 기록과 실제 매출 갱신은 하나의 트랜잭션으로 묶었고, 동시 갱신에서는 애플리케이션에서 값을 읽고 다시 저장하지 않고 데이터베이스 원자적 갱신을 사용해 갱신 손실을 막았습니다.
+
+---
+
+## 17. 답변 자동화 틀
+
+어떤 질문이 나와도 다음 다섯 문장 구조로 답합니다.
+
+```text
+1. 문제
+"이 구조에서는 OOO 문제가 발생할 수 있습니다."
+
+2. 대안
+"A와 B를 고려할 수 있습니다."
+
+3. 선택
+"이 프로젝트에서는 OOO 때문에 B를 선택했습니다."
+
+4. 단점
+"대신 OOO라는 단점이 있습니다."
+
+5. 검증
+"그래서 OOO 상황을 재현해 결과가 깨지지 않는지 확인했습니다."
+```
+
+예시:
+
+> 최소 한 번 전달 방식에서는 같은 이벤트가 다시 들어올 수 있습니다. 메모리에서 중복을 관리하거나 데이터베이스에서 관리하는 방법을 생각할 수 있습니다. 저는 여러 서버와 재시작 상황에서도 동일한 기준이 필요해서 이벤트 ID를 PostgreSQL 기본 키로 관리했습니다. 대신 처리 완료 이벤트 기록이 계속 쌓인다는 비용이 있습니다. 동일한 UUID를 여러 번 전송해 실제 매출이 한 번만 증가하는지 확인했습니다.
+
+이 틀을 Kafka, 트랜잭션, 분산 락, 캐시, 비동기 처리 등 다른 프로젝트 질문에도 동일하게 사용합니다.
