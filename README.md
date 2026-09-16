@@ -333,6 +333,8 @@ Kafka의 `advertised.listeners`는 접속한 클라이언트에게 알려 줄 �
 
 소비자의 `earliest`는 매번 처음부터 읽으라는 뜻이 아니다. 소비자 그룹의 유효한 커밋 위치가 없을 때 적용된다. 오프셋은 그 그룹이 어디까지 읽었는지 나타내는 위치다.
 
+Actuator 노출 목록에는 실제 제공하는 `health`, `info`, `metrics`를 적었다. 예전 설정의 `prometheus`는 전용 지표 등록기 의존성 없이 이름만 적혀 있어 제외했다. 노출 목록에 이름을 넣는 것만으로 해당 기능이 생기는 것은 아니다.
+
 #### [`CommerceEventsApplication.java`](service/src/main/java/dev/kangwoul/commerce/CommerceEventsApplication.java) — 시작점
 
 `main`에서 Spring Boot를 시작한다. `@SpringBootApplication`이 하위 패키지의 컨트롤러, 서비스, 설정 등을 찾아 빈으로 등록한다. 빈은 스프링이 생성하고 의존성을 연결해 주는 객체라고 이해했다.
@@ -527,22 +529,26 @@ docker compose exec -T postgres psql -U commerce -d commerce_events -c "SELECT r
 
 ### 8. README와 구현을 대조한 기록
 
-2026-09-17 기준 로컬 검증 환경은 Windows, JDK 25.0.3, Maven 3.9.15다. 컴파일 대상은 Java 17이며 GitHub CI는 Java 17로 설정했다. 실제 실행하지 않은 내용을 성공으로 기록하지 않는다.
+2026-09-17 기준 로컬 검증 환경은 Windows, JDK 25.0.3, Maven 3.9.15다. 컴파일 대상은 Java 17이며 GitHub CI에서는 Ubuntu와 Java 17.0.20.1로 검증했다. 실제 실행하지 않은 내용을 성공으로 기록하지 않는다.
+
+검증한 코드 커밋은 [`78c1cfa`](https://github.com/kangwoul2/commerce-event-pipeline/commit/78c1cfa19070094ea0562ce304c71bf39b3f3853)다. [GitHub Actions 실행 결과](https://github.com/kangwoul2/commerce-event-pipeline/actions/runs/35161333243)에서 **단위 테스트 20개 + 통합 테스트 6개, 실패 0·건너뜀 0**을 확인했다. 실행 페이지의 `test-reports` 첨부 결과에는 Maven 테스트 보고서가 보관된다.
 
 | 확인 대상 | 발견한 점과 보완 | 검증 범위 |
 |---|---|---|
 | Kafka 발행 후 `202` | 기존에는 비동기 발행 결과를 무시함 → 성공 확인 후 응답, 실패·시간 초과는 `503` | 발행기·모의 HTTP 테스트 |
-| Spring Boot 4 자동 설정 | Kafka·Flyway 일반 라이브러리를 자동 설정 포함 스타터로 교체 | 의존성 반영과 빌드 확인, 실제 시작은 통합 테스트 대상 |
+| Spring Boot 4 자동 설정 | Kafka·Flyway 일반 라이브러리를 자동 설정 포함 스타터로 교체 | CI에서 서비스 시작, Flyway V1 적용, Kafka 발행·소비 확인 |
 | Kafka JSON 변환 | 기존 Jackson 2용 변환기와 현재 Jackson 3 의존성이 맞지 않음 → 현재 버전용 변환기로 수정 | 설정 파일의 실제 클래스 생성과 이벤트 왕복 변환 검사 |
 | 입력과 DB 규칙 | 지역 최대 120자, 금액 정수 18자리·소수 2자리 검증 추가 | 잘못된 입력의 `400`과 발행 미호출 검사 |
 | 소비 오류 | DLQ 없이 기본 오류 처리에 의존함 → 소비 중단 정책 명시 | 코드·설정 확인, 장애 후 재시작 실험은 미실시 |
-| 중복 전송 실험 | 요청만 보내던 스크립트에 집계 대기·결과 검사 추가 | Python 문법 검사, 실제 전체 경로는 통합 테스트 대상 |
+| 중복 전송 실험 | 요청만 보내던 스크립트에 집계 대기·결과 검사 추가 | Python 문법 검사와 CI에서 실제 서버 대상 스크립트 실행 성공 |
 | 테스트 | 중복 분기 1개에서 발행·HTTP·변환·집계 분기 20개로 확장 | 로컬 `mvn verify` 성공, 실패 0·건너뜀 0 |
-| DB 정합성과 전체 연결 | 실제 기반 시설을 쓰는 통합 테스트 6개 추가 | 로컬 Docker 엔진 연결 불가로 실행 미완료. CI 실행 결과는 별도 확인 필요 |
-| Compose | 서비스별 상태 검사 추가 | `docker compose config --quiet` 성공. 컨테이너 실행 성공과는 별개 |
-| GitHub CI | 단위 테스트에 더해 실제 기반 시설과 통합 테스트 실행, 결과 보고서 보관 | 워크플로 파일 구성 완료. 로컬 결과와 CI 결과를 구분 |
+| DB 정합성과 전체 연결 | 실제 기반 시설을 쓰는 통합 테스트 6개 추가 | CI에서 중복·롤백 후 재시도·동시 처리·HTTP 전체 경로·실험 스크립트 모두 통과 |
+| Compose | 서비스별 상태 검사 추가 | 로컬 설정 검사 통과, CI에서 PostgreSQL·Kafka 시작 및 상태 검사 통과 |
+| GitHub CI | 단위 테스트에 더해 실제 기반 시설과 통합 테스트 실행, 결과 보고서 보관 | 해당 코드 커밋의 전체 작업 성공 및 보고서 업로드 확인 |
 
-로컬에서는 Docker 명령 자체는 설치돼 있지만 `dockerDesktopLinuxEngine` 파이프에 연결하지 못했다. 따라서 이 기록만으로 모든 파일이 실제 환경에서 정상 동작한다고 단정할 수 없다. Docker 엔진이 정상인 환경에서 통합 검증을 실행하고, GitHub Actions의 해당 커밋 결과와 테스트 보고서를 확인해야 한다.
+로컬에서는 Docker 명령 자체는 설치돼 있지만 `dockerDesktopLinuxEngine` 파이프에 연결하지 못했다. 실제 연동 검증은 GitHub CI 환경에서 완료했다. 따라서 서버 코드와 Compose의 연결은 확인했지만, 이 PC에서 서비스를 띄우려면 로컬 Docker 엔진 문제는 별도로 해결해야 한다.
+
+통합 테스트는 같은 이벤트 24개를 동시에 처리해 1회만 반영되는지, 서로 다른 이벤트 24개가 같은 지역에 24건·246.00으로 누적되는지 확인했다. 롤백 테스트에서는 일부러 121자 지역을 보내 DB 오류를 만든 뒤 ID 기록이 남지 않는지, 같은 ID로 정상 요청을 다시 처리할 수 있는지 확인했다. 그래서 로그의 `value too long for type character varying(120)`은 이 테스트가 의도적으로 만든 오류다.
 
 아직 남은 검증은 소비자 강제 종료 후 재전달, 브로커 장애, 잘못된 메시지 처리와 복구, 대규모 부하 실험이다. 같은 키에 다른 본문을 보내는 충돌 검사, DLQ, 소비 중단 상태 감지도 다음 개선 항목으로 남긴다.
 
